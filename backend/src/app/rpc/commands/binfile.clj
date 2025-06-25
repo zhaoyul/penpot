@@ -20,8 +20,9 @@
    [app.loggers.webhooks :as-alias webhooks]
    [app.media :as media]
    [app.rpc :as-alias rpc]
-   [app.rpc.commands.files :as files]
-   [app.rpc.commands.projects :as projects]
+  [app.rpc.commands.files :as files]
+  [app.rpc.commands.files_update :as files.update]
+  [app.rpc.commands.projects :as projects]
    [app.rpc.commands.teams :as teams]
    [app.rpc.doc :as-alias doc]
    [app.tasks.file-gc]
@@ -39,6 +40,15 @@
   schema:export-binfile
   [:map {:title "export-binfile"}
    [:file-id ::sm/uuid]
+   [:version {:optional true} ::sm/int]
+   [:include-libraries ::sm/boolean]
+   [:embed-assets ::sm/boolean]])
+
+(def ^:private
+  schema:export-page-binfile
+  [:map {:title "export-page-binfile"}
+   [:file-id ::sm/uuid]
+   [:page-id ::sm/uuid]
    [:version {:optional true} ::sm/int]
    [:include-libraries ::sm/boolean]
    [:embed-assets ::sm/boolean]])
@@ -73,6 +83,23 @@
                 :file-id (str file-id)
                 :cause cause))))))
 
+(defn stream-export-page-v3
+  [cfg {:keys [file-id page-id include-libraries embed-assets] :as params}]
+  (yres/stream-body
+   (fn [_ output-stream]
+     (try
+       (-> cfg
+           (assoc ::bfc/ids #{file-id})
+           (assoc ::bfc/page-ids #{page-id})
+           (assoc ::bfc/embed-assets embed-assets)
+           (assoc ::bfc/include-libraries include-libraries)
+           (bf.v3/export-files! output-stream))
+       (catch Throwable cause
+         (l/err :hint "exception on exporting page"
+                :file-id (str file-id)
+                :page-id (str page-id)
+                :cause cause))))))
+
 (sv/defmethod ::export-binfile
   "Export a penpot file in a binary format."
   {::doc/added "1.15"
@@ -87,6 +114,22 @@
                     2 (throw (ex-info "not-implemented" {}))
                     3 (stream-export-v3 cfg params))]
 
+      {::yres/status 200
+       ::yres/headers {"content-type" "application/octet-stream"}
+       ::yres/body body})))
+
+(sv/defmethod ::export-page-binfile
+  "Export a single page in a binary format."
+  {::doc/added "1.20"
+   ::webhooks/event? true
+   ::sm/params schema:export-page-binfile}
+  [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id file-id page-id version] :as params}]
+  (files/check-read-permissions! pool profile-id file-id)
+  (fn [_]
+    (let [version (or version 3)
+          body    (case (int version)
+                    3 (stream-export-page-v3 cfg params)
+                    (throw (ex-info "not-implemented" {})))]
       {::yres/status 200
        ::yres/headers {"content-type" "application/octet-stream"}
        ::yres/body body})))
@@ -126,6 +169,12 @@
            [:map-of ::sm/uuid [:string {:max 250}]]]]
    [:project-id ::sm/uuid]
    [:version {:optional true} ::sm/int]
+  [:file ::media/upload]])
+
+(def ^:private schema:import-page-binfile
+  [:map {:title "import-page-binfile"}
+   [:file-id ::sm/uuid]
+   [:page-id ::sm/uuid]
    [:file ::media/upload]])
 
 (sv/defmethod ::import-binfile
@@ -142,3 +191,37 @@
     (with-meta
       (sse/response (partial import-binfile cfg params))
       {::audit/props {:file nil}})))
+
+(defn- import-page-binfile*
+  [{:keys [::db/pool] :as cfg} {:keys [profile-id file-id page-id file]}]
+  (let [page (bf.v3/read-page! (:path file))
+        cfg  (assoc cfg ::rpc/profile-id profile-id)]
+    (files.update/update-file! cfg file-id
+      (fn [_ file]
+        (let [page' (-> page
+                         (assoc :id page-id)
+                         (update :objects (fn [objs]
+                                            (reduce-kv (fn [m id obj]
+                                                         (assoc m id (assoc obj :page-id page-id)))
+                                                       {}
+                                                       objs))))]
+          (update file :data
+                  (fn [data]
+                    (let [idx (.indexOf (:pages data) page-id)
+                          idx (if (neg? idx) (count (:pages data)) idx)]
+                      (-> data
+                          (assoc-in [:pages-index page-id] page')
+                          (update :pages (fn [p]
+                                           (if (>= idx (count p))
+                                             (conj p page-id)
+                                             (assoc p idx page-id))))))))))))
+
+(sv/defmethod ::import-page-binfile
+  "Import a single page into an existing file."
+  {::doc/added "1.20"
+   ::webhooks/event? true
+   ::sm/params schema:import-page-binfile}
+  [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id file-id page-id] :as params}]
+  (files/check-edition-permissions! pool profile-id file-id)
+  (import-page-binfile* cfg (assoc params :profile-id profile-id))
+  {:page-id page-id})

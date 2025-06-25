@@ -106,3 +106,25 @@
                      (v3/import-files!))]
       (t/is (= (count result) 1))
       (t/is (every? uuid? result)))))
+
+(t/deftest export-page-binfile-v3
+  (let [profile (th/create-profile* 1)
+        file    (prepare-simple-file profile)
+        page-id (uuid/custom 1 1)
+        other-id (uuid/custom 1 2)
+        output  (tmp/tempfile :suffix ".zip")]
+
+    (v3/export-files!
+     (-> th/*system*
+         (assoc ::bfc/ids #{(:id file)})
+         (assoc ::bfc/page-ids #{page-id})
+         (assoc ::bfc/embed-assets false)
+         (assoc ::bfc/include-libraries false))
+     (io/output-stream output))
+
+    (with-open [zip (java.util.zip.ZipFile. (fs/file output))]
+      (let [names (into #{} (map #(.getName %) (enumeration-seq (.entries zip))))
+            path1 (str "files/" (:id file) "/pages/" page-id ".json")
+            path2 (str "files/" (:id file) "/pages/" other-id ".json")]
+        (t/is (contains? names path1))
+        (t/is (not (contains? names path2))))))
