@@ -272,6 +272,9 @@
 
         pages        (:pages data)
         pages-index  (:pages-index data)
+        page-set     (some-> (::page-ids cfg) set)
+        pages        (if page-set (vec (filter page-set pages)) pages)
+        pages-index  (if page-set (select-keys pages-index page-set) pages-index)
 
         thumbnails   (bfc/get-file-object-thumbnails cfg file-id)]
 
@@ -659,20 +662,23 @@
        (not-empty)))
 
 (defn- read-file-pages
-  [{:keys [::bfc/input ::file-id ::entries] :as cfg}]
-  (->> (keep (match-page-entry-fn file-id) entries)
-       (keep (fn [{:keys [id entry]}]
-               (let [page (->> (read-entry input entry)
-                               (decode-page))
-                     page (dissoc page :options)]
-                 (when (= id (:id page))
-                   (let [objects (-> (assoc cfg ::page-id id)
-                                     (read-file-shapes))]
-                     (assoc page :objects objects))))))
-       (sort-by :index)
-       (reduce (fn [result {:keys [id] :as page}]
-                 (assoc result id (dissoc page :index)))
-               (d/ordered-map))))
+  [{:keys [::bfc/input ::file-id ::entries ::page-ids] :as cfg}]
+  (let [page-set (some-> page-ids set)]
+    (->> (keep (match-page-entry-fn file-id) entries)
+         (filter (fn [{:keys [id]}]
+                   (or (nil? page-set) (contains? page-set id))))
+         (keep (fn [{:keys [id entry]}]
+                 (let [page (->> (read-entry input entry)
+                                 (decode-page))
+                       page (dissoc page :options)]
+                   (when (= id (:id page))
+                     (let [objects (-> (assoc cfg ::page-id id)
+                                       (read-file-shapes))]
+                       (assoc page :objects objects))))))
+         (sort-by :index)
+         (reduce (fn [result {:keys [id] :as page}]
+                   (assoc result id (dissoc page :index)))
+                 (d/ordered-map)))))
 
 (defn- read-file-thumbnails
   [{:keys [::bfc/input ::file-id ::entries] :as cfg}]
@@ -1029,3 +1035,15 @@
                 :id (str id)
                 :elapsed (dt/format-duration (tp))
                 :error? (some? @cs))))))
+
+(defn read-page!
+  "Read the first page from a binfile without persisting it."
+  [input]
+  (with-open [input (ZipFile. (fs/file input))]
+    (let [manifest (read-manifest input)
+          file-id  (:id (first (:files manifest)))
+          entries  (read-zip-entries input)
+          pages    (read-file-pages {::bfc/input input
+                                     ::file-id file-id
+                                     ::entries entries})]
+      (-> pages vals first)))
